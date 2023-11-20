@@ -18,11 +18,13 @@
 enum MenuId : int {
     MENU_TEST1 = 0,
     MENU_LOAD_SHELLCODE_INFO,
-    MENU_SAVE_SHELLCODE_INFO
+    MENU_SAVE_SHELLCODE_INFO,
+    MENU_ENUM_SHELLCODE
 };
 
 void SaveShellCodeComment();
 void LoadShellCodeComment();
+void EnumShellCodeByFeature();
 static void cbMenuEntry(CBTYPE cbType, void* callbackInfo)
 {
     PLUG_CB_MENUENTRY* info = (PLUG_CB_MENUENTRY*)callbackInfo;
@@ -35,6 +37,9 @@ static void cbMenuEntry(CBTYPE cbType, void* callbackInfo)
         break;
     case MENU_SAVE_SHELLCODE_INFO:
         SaveShellCodeComment();
+        break;
+    case MENU_ENUM_SHELLCODE:
+        EnumShellCodeByFeature();
         break;
     }
 }
@@ -80,6 +85,7 @@ void pluginSetup()
     _plugin_menuaddentry(hMenu, MENU_TEST1, "&Test1");
     _plugin_menuaddentry(hMenu, MENU_LOAD_SHELLCODE_INFO, "&LoasShellcodeInfo");
     _plugin_menuaddentry(hMenu, MENU_SAVE_SHELLCODE_INFO, "&SaveShellcodeInfo");
+    _plugin_menuaddentry(hMenu, MENU_ENUM_SHELLCODE, "&EnumShellCode");
 }
 
 
@@ -232,7 +238,7 @@ struct UserCustomShellCode {
     std::wstring name;
     ShellCodeFeature feature;
 };
-std::vector<UserCustomShellCode> g_user_custom_shellcode_features;
+
 
 
 
@@ -255,14 +261,14 @@ std::vector<unsigned char> HexLineToBuffer(const std::string& line)
     }
     return result;
 }
-void LoadUserCustomShellCodeFeature()
+std::vector<UserCustomShellCode>  LoadUserCustomShellCodeFeature()
 {
-    g_user_custom_shellcode_features.clear();
+    std::vector<UserCustomShellCode> result;
 
     char process_name[MAX_PATH] = { 0 };
     if (!Script::Module::GetMainModuleName(process_name)) {
         dputs("LoadUserCustomShellCodeFeature GetMainModuleName Failed");
-        return;
+        return {};
     }
     std::wstring file_name = GetMyPluginDataPath() + string_tool::CharToWide(process_name) + L".shellcode_features";
     auto lines = file_tools::ReadAsciiFileLines(file_name);
@@ -279,29 +285,32 @@ void LoadUserCustomShellCodeFeature()
             custum_shellcode_feature.name = string_tool::utf8_to_wstring(name);
             custum_shellcode_feature.feature.feature_code = feature_code;
             custum_shellcode_feature.feature.feature_offset = feature_offset;
-            g_user_custom_shellcode_features.push_back(custum_shellcode_feature);
+            result.push_back(custum_shellcode_feature);
         }
     }
+    return result;
 }
 
-std::map<DWORD, std::wstring> g_analyzed_custom_shellcode_list;
-void AnalyzeCacheShellCodeBase()
+
+std::map<DWORD, std::wstring>  AnalyzeCacheShellCodeBase(const std::vector<UserCustomShellCode>& shellcode_features)
 {
+    std::map<DWORD, std::wstring> result;
     auto shell_code_list = GetShellCodeMemoryList();
     for (const auto& shell_code : shell_code_list) {
-        for (auto& feature : g_user_custom_shellcode_features) {
+        for (auto& feature : shellcode_features) {
             if (shell_code.size == feature.size) {
                 auto bytes = ReadMem((unsigned char*)shell_code.base_addr + feature.feature.feature_offset, feature.feature.feature_code.size());
                 if (memcmp(bytes.data(), feature.feature.feature_code.data(), feature.feature.feature_code.size()) == 0) {
-                    g_analyzed_custom_shellcode_list[shell_code.base_addr] = feature.name;
+                    result[shell_code.base_addr] = feature.name;
                 }
             }
         }
     }
+    return result;
 }
 
 
-void SaveUserCustomShellCodeFeature()
+void SaveUserCustomShellCodeFeature(const std::vector<UserCustomShellCode>& shellcode_features)
 {
     char process_name[MAX_PATH] = { 0 };
     if (!Script::Module::GetMainModuleName(process_name)) {
@@ -311,7 +320,7 @@ void SaveUserCustomShellCodeFeature()
     std::wstring file_name = GetMyPluginDataPath() + string_tool::CharToWide(process_name) + L".shellcode_features";
 
     std::string file_content;
-    for (auto& feature : g_user_custom_shellcode_features) {
+    for (auto& feature : shellcode_features) {
         std::string line = fmt::format("{:08X}|{}|{:08X}|{}\r\n", feature.size, string_tool::wstring_to_utf8(feature.name), feature.feature.feature_offset, BufferToLine(feature.feature.feature_code));
         file_content += line;
     }
@@ -320,15 +329,6 @@ void SaveUserCustomShellCodeFeature()
 
 
 
-std::wstring GetUserCustomShellCodeName(DWORD addr) {
-    auto iter = g_analyzed_custom_shellcode_list.find(addr);
-    if (iter == g_analyzed_custom_shellcode_list.end()) {
-        return L"";
-    }
-    else {
-        return iter->second;
-    }
-}
 struct DialogCustomData {
     DWORD base_addr = 0;
     wchar_t name[100];
@@ -399,7 +399,8 @@ bool DialogInputAddShellCodeFeature(DWORD shellcode_base_addr, DWORD shellcode_s
     dlg_data.base_addr = shellcode_base_addr;
     INT_PTR dlg_ret = DialogBoxParam(g_cur_dll_instalce, MAKEINTRESOURCE(IDD_DIALOG_INPUT_SHELLCODE_FEATURE), main_window, InputShellCodeFeatureDialogProc, (LPARAM)&dlg_data);
     if (dlg_ret == IDOK) {
-        if (std::find_if(g_user_custom_shellcode_features.begin(), g_user_custom_shellcode_features.end(), [&dlg_data](const UserCustomShellCode& s) {return s.name == dlg_data.name; }) != g_user_custom_shellcode_features.end()) {
+        auto custom_shellcode_features = LoadUserCustomShellCodeFeature();
+        if (std::find_if(custom_shellcode_features.begin(), custom_shellcode_features.end(), [&dlg_data](const UserCustomShellCode& s) {return s.name == dlg_data.name; }) != custom_shellcode_features.end()) {
             ::MessageBoxA(main_window, "ShellCode名称重复", NULL, MB_OK);
             return false;
         }
@@ -427,8 +428,8 @@ bool DialogInputAddShellCodeFeature(DWORD shellcode_base_addr, DWORD shellcode_s
                 }
                 custom_shellcode.feature.feature_offset = dlg_data.feature_addr_start - dlg_data.base_addr;
                 name = custom_shellcode.name;
-                g_user_custom_shellcode_features.push_back(custom_shellcode);
-                SaveUserCustomShellCodeFeature();
+                custom_shellcode_features.push_back(custom_shellcode);
+                SaveUserCustomShellCodeFeature(custom_shellcode_features);
                 return true;
             }
             else {
@@ -450,8 +451,8 @@ std::wstring GetCommentSavePath(const std::wstring& exe_name)
 
 void LoadShellCodeComment()
 {
-    LoadUserCustomShellCodeFeature();
-    AnalyzeCacheShellCodeBase();
+    auto shellcode_features = LoadUserCustomShellCodeFeature();
+    auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
     //这里要检测是否要未保存的，要不然Load会覆盖
     {
         auto shell_code_list = GetShellCodeMemoryList();
@@ -485,42 +486,46 @@ void LoadShellCodeComment()
 
     auto shell_code_list = GetShellCodeMemoryList();
     for (const auto& vmq : shell_code_list) {
-        std::wstring name = GetUserCustomShellCodeName(vmq.base_addr);
-        if (name.length() > 0) {
-            dprintf("ShellCode:0x%08x  size:0x%08x\n", vmq.base_addr, vmq.size);
-            std::wstring file_name = path + name + L".txt";
-            auto lines = file_tools::ReadAsciiFileLines(file_name);
-            for (const auto& line : lines) {
-                //0003B853^COMMENT^ssssssssss;
-                auto flag = line.find('^');
-                if (flag == std::string::npos) {
-                    dputs("^ is not find1");
-                    continue;
-                }
-                DWORD offset = std::stoul(line.substr(0, flag), nullptr, 16);
+        auto iter = shellcode_map.find(vmq.base_addr);
+        if (iter != shellcode_map.end()) {
+            std::wstring name = iter->second;
 
-                auto flag2 = line.find('^', flag + 1);
-                if (flag2 == std::string::npos) {
-                    dputs("^ is not find2");
-                    continue;
-                }
-                std::string type_name = line.substr(flag + 1, flag2 - (flag + 1));
-                if (type_name.empty() || (type_name != "COMMENT" && type_name != "LABEL")) {
-                    dputs("^ is not find not comment and label");
-                    continue;
-                }
+            if (name.length() > 0) {
+                dprintf("ShellCode:0x%08x  size:0x%08x\n", vmq.base_addr, vmq.size);
+                std::wstring file_name = path + name + L".txt";
+                auto lines = file_tools::ReadAsciiFileLines(file_name);
+                for (const auto& line : lines) {
+                    //0003B853^COMMENT^ssssssssss;
+                    auto flag = line.find('^');
+                    if (flag == std::string::npos) {
+                        dputs("^ is not find1");
+                        continue;
+                    }
+                    DWORD offset = std::stoul(line.substr(0, flag), nullptr, 16);
 
-                std::string text = line.substr(flag2 + 1);
+                    auto flag2 = line.find('^', flag + 1);
+                    if (flag2 == std::string::npos) {
+                        dputs("^ is not find2");
+                        continue;
+                    }
+                    std::string type_name = line.substr(flag + 1, flag2 - (flag + 1));
+                    if (type_name.empty() || (type_name != "COMMENT" && type_name != "LABEL")) {
+                        dputs("^ is not find not comment and label");
+                        continue;
+                    }
 
-                dprintf("%s  addr:0x%08x,:%s\n", type_name.c_str(), vmq.base_addr + offset, text.c_str());
+                    std::string text = line.substr(flag2 + 1);
 
-                char ansi_text[500] = { 0 };
-                strcpy_s(ansi_text, text.c_str());
-                if (type_name == "COMMENT") {
-                    Script::Comment::Set(vmq.base_addr + offset,  ansi_text, true);
-                }
-                else if (type_name == "LABEL") {
-                    Script::Label::Set(vmq.base_addr + offset,ansi_text, true);
+                    dprintf("%s  addr:0x%08x,:%s\n", type_name.c_str(), vmq.base_addr + offset, text.c_str());
+
+                    char ansi_text[500] = { 0 };
+                    strcpy_s(ansi_text, text.c_str());
+                    if (type_name == "COMMENT") {
+                        Script::Comment::Set(vmq.base_addr + offset, ansi_text, true);
+                    }
+                    else if (type_name == "LABEL") {
+                        Script::Label::Set(vmq.base_addr + offset, ansi_text, true);
+                    }
                 }
             }
         }
@@ -535,8 +540,10 @@ void SaveShellCodeComment()
     //遍历 ShellCode
     //遍历 ShellCode里注释
     //保存注释 怎么标识一个ShellCode? 1.大小 2.特征码（shellcode md5?） 感觉也不行。因为shellcode有些地址每次加载都会被换掉 所以只能自己标识，那就用指定偏移的一段特征码标识吧
-    LoadUserCustomShellCodeFeature();
-    AnalyzeCacheShellCodeBase();
+    auto shellcode_features = LoadUserCustomShellCodeFeature();
+    auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
+
+    dprintf("shellcode_features:%d matched_count:%d\n",shellcode_features.size(),shellcode_map.size());
 
     char process_name[MAX_PATH] = { 0 };
     if (!Script::Module::GetMainModuleName(process_name)) {
@@ -556,15 +563,17 @@ void SaveShellCodeComment()
 
 
         if (comments.size() > 0 || labels.size()) {
-            std::wstring name = GetUserCustomShellCodeName(vmq.base_addr);
-            if (name.length() == 0) {
+            auto iter = shellcode_map.find(vmq.base_addr);
+            std::wstring name;
+            if (iter == shellcode_map.end()) {
                 if (!DialogInputAddShellCodeFeature(vmq.base_addr, vmq.size, name)) {
                     continue;
                 }
-                else {
-                    g_analyzed_custom_shellcode_list[vmq.base_addr] = name;
-                }
             }
+            else {
+                name = iter->second;
+            }
+
             std::wstring file_name = path + name + L".txt";
             std::string file_content;
             for (const auto& comment : comments) {
@@ -577,6 +586,15 @@ void SaveShellCodeComment()
             }
             file_tools::WriteFile(file_name, file_content.c_str(), file_content.length());
         }
+    }
+}
+
+void EnumShellCodeByFeature()
+{
+    auto shellcode_features = LoadUserCustomShellCodeFeature();
+    auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
+    for (auto it : shellcode_map) {
+        dprintf("ShellCodeName:%s,BaseAddr:%8x\n",string_tool::wstring_to_utf8(it.second).c_str(), it.first);
     }
 }
 
