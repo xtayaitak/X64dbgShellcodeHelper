@@ -19,7 +19,8 @@ enum MenuId : int {
     MENU_TEST1 = 0,
     MENU_LOAD_SHELLCODE_INFO,
     MENU_SAVE_SHELLCODE_INFO,
-    MENU_ENUM_SHELLCODE
+    MENU_ENUM_SHELLCODE,
+    MENU_ENUM_SEARCH_STRING,
 };
 
 void SaveShellCodeComment();
@@ -41,7 +42,11 @@ static void cbMenuEntry(CBTYPE cbType, void* callbackInfo)
     case MENU_ENUM_SHELLCODE:
         EnumShellCodeByFeature();
         break;
+    case MENU_ENUM_SEARCH_STRING:
+        SearchString();
+        break;
     }
+
 }
 
 static DWORD g_pid = 0;
@@ -596,6 +601,11 @@ void EnumShellCodeByFeature()
     for (auto it : shellcode_map) {
         dprintf("ShellCodeName:%s,BaseAddr:%8x\n",string_tool::wstring_to_utf8(it.second).c_str(), it.first);
     }
+}
+
+void SearchString()
+{
+
 }
 
 

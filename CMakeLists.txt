@@ -43,8 +43,12 @@ set(CMKR_TARGET PluginTemplate)
 set(PluginTemplate_SOURCES "")
 
 list(APPEND PluginTemplate_SOURCES
+	"src/VMQuery.cpp"
 	"src/plugin.cpp"
 	"src/pluginmain.cpp"
+	"src/CmnHdr.h"
+	"src/Toolhelp.h"
+	"src/VMQuery.h"
 	"src/plugin.h"
 	"src/pluginmain.h"
 )
