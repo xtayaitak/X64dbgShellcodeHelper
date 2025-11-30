@@ -47,6 +47,7 @@ list(APPEND PluginTemplate_SOURCES
 	"src/plugin.cpp"
 	"src/pluginmain.cpp"
 	"src/CmnHdr.h"
+	"src/PluginHelper.h"
 	"src/Toolhelp.h"
 	"src/VMQuery.h"
 	"src/plugin.h"

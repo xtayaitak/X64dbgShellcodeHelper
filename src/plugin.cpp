@@ -1,52 +1,58 @@
 #include "plugin.h"
 #include "pluginsdk/_scriptapi_comment.h"
 #include "pluginsdk/_scriptapi_module.h"
-#include "StringTool.h"
-#include "FileTool.h"
-#include "DebugOutput.h"
-#include "Toolhelp.h"
-#include "VMQuery.h"
-#include <Psapi.h>
+#include "pluginsdk/_scriptapi_gui.h"
+#include "pluginsdk/_scriptapi_memory.h"
+#include "PluginHelper.h"
+
+#include "CmnHdr.h"
 #include <memory>
-#include "ResManager.h"
-#include "fmt/format.h"
 #include <cassert>
 #include <map>
+#include <set>
+#include <CommCtrl.h>
 #include "../build/resource.h"
+
+extern bool ModUnload(duint Base);
 
 
 enum MenuId : int {
-    MENU_TEST1 = 0,
-    MENU_LOAD_SHELLCODE_INFO,
-    MENU_SAVE_SHELLCODE_INFO,
+    MENU_LOAD_SHELLCODE_INFO = 0,
     MENU_ENUM_SHELLCODE,
-    MENU_ENUM_SEARCH_STRING,
+    MENU_UNLOAD_VIRTUAL_MODULES,
+    MENU_VIEW_FEATURES,
+    MENU_MARK_AS_SHELLCODE,
 };
 
-void SaveShellCodeComment();
+
 void LoadShellCodeComment();
 void EnumShellCodeByFeature();
+void UnloadAllVirtualModules();
+void ViewShellCodeFeatures();
+void MarkAsShellCode();
+
+bool cbRemoveAllVirtualModCommand(int argc, char** argv);
 static void cbMenuEntry(CBTYPE cbType, void* callbackInfo)
 {
     PLUG_CB_MENUENTRY* info = (PLUG_CB_MENUENTRY*)callbackInfo;
     switch (info->hEntry)
     {
-    case MENU_TEST1:
-        break;
     case MENU_LOAD_SHELLCODE_INFO:
         LoadShellCodeComment();
-        break;
-    case MENU_SAVE_SHELLCODE_INFO:
-        SaveShellCodeComment();
         break;
     case MENU_ENUM_SHELLCODE:
         EnumShellCodeByFeature();
         break;
-    case MENU_ENUM_SEARCH_STRING:
-        SearchString();
+    case MENU_UNLOAD_VIRTUAL_MODULES:
+        UnloadAllVirtualModules();
+        break;
+    case MENU_VIEW_FEATURES:
+        ViewShellCodeFeatures();
+        break;
+    case MENU_MARK_AS_SHELLCODE:
+        MarkAsShellCode();
         break;
     }
-
 }
 
 static DWORD g_pid = 0;
@@ -75,6 +81,9 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct)
     _plugin_registercallback(pluginHandle, CB_ATTACH, cbAttachCreateProcessDetach);
     _plugin_registercallback(pluginHandle, CB_CREATEPROCESS, cbAttachCreateProcessDetach);
     _plugin_registercallback(pluginHandle, CB_DETACH, cbAttachCreateProcessDetach);
+    
+    _plugin_registercommand(pluginHandle, "removeallvirtualmod", cbRemoveAllVirtualModCommand, true);
+    
     return true; //Return false to cancel loading the plugin.
 }
 
@@ -82,24 +91,26 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct)
 void pluginStop()
 {
     _plugin_unregistercallback(pluginHandle, CB_MENUENTRY);
+    _plugin_unregistercommand(pluginHandle, "removeallvirtualmod");
 }
 
 //Do GUI/Menu related things here.
 void pluginSetup()
 {
-    _plugin_menuaddentry(hMenu, MENU_TEST1, "&Test1");
-    _plugin_menuaddentry(hMenu, MENU_LOAD_SHELLCODE_INFO, "&LoasShellcodeInfo");
-    _plugin_menuaddentry(hMenu, MENU_SAVE_SHELLCODE_INFO, "&SaveShellcodeInfo");
-    _plugin_menuaddentry(hMenu, MENU_ENUM_SHELLCODE, "&EnumShellCode");
+    _plugin_menuaddentry(hMenu, MENU_LOAD_SHELLCODE_INFO, "&Load ShellCode as Virtual Module");
+    _plugin_menuaddentry(hMenu, MENU_ENUM_SHELLCODE, "&Enum ShellCode");
+    _plugin_menuaddentry(hMenu, MENU_UNLOAD_VIRTUAL_MODULES, "&Unload All Virtual Modules");
+    _plugin_menuaddentry(hMenu, MENU_VIEW_FEATURES, "&View ShellCode Features");
+    _plugin_menuaddentry(hMenuDisasm, MENU_MARK_AS_SHELLCODE, "&Mark as ShellCode");
 }
 
 
 std::wstring GetMyPluginDataPath()
 {
     static std::wstring path = []() -> std::wstring {
-        std::wstring s = file_tools::GetCurrentAppPath() + L"ShellcodeComment\\";
-        if (!file_tools::FileExist(s)) {
-            file_tools::CreateDirectoryNested(s);
+        std::wstring s = GetCurrentAppPath() + L"ShellcodeComment\\";
+        if (!FileExist(s)) {
+            CreateDirectoryNested(s);
         }
         return s;
     }();
@@ -113,130 +124,81 @@ struct MemoryInfo {
     size_t size = 0;
 };
 
-std::vector<MemoryInfo> GetShellCodeMemoryList()
+std::vector<MemoryInfo> GetShellCodeMemoryList(const std::vector<DWORD>& target_sizes)
 {
-    CToolhelp toolhelp;
-    DWORD pid = g_pid;
-    if (pid == 0) {
-        dputs("GetShellCodeMemoryList Pid is 0");
+    std::vector<MemoryInfo> result;
+    
+    // 如果目标大小列表为空，直接返回空结果
+    if (target_sizes.empty()) {
+        return result;
+    }
+    
+    // 使用 x64dbg 的 DbgMemMap API 获取所有内存页信息
+    MEMMAP memmap = { 0 };
+    if (!DbgMemMap(&memmap)) {
+        dputs("GetShellCodeMemoryList DbgMemMap Failed");
         return {};
     }
-    toolhelp.CreateSnapshot(TH32CS_SNAPALL, pid);
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION,FALSE, pid);
-    if (!hProcess) {
-        DWORD last_error = ::GetLastError();
-        dprintf("GetShellCodeMemoryList OpenProcess Failed:%d\n", last_error);
-        return {};
-    }
-    SetResDeleter(hProcess, [](HANDLE& h) {::CloseHandle(h); });
-    auto HasMappedModule = [&toolhelp, &hProcess](VMQUERY* pvmq) {
-        if (pvmq->dwRgnStorage == MEM_PRIVATE && (pvmq->dwRgnProtection & PAGE_EXECUTE_READWRITE) > 0) {
-            MODULEENTRY32 me = { 0 };
-            me.dwSize = sizeof(MODULEENTRY32);
-            if (toolhelp.ModuleFind(pvmq->pvRgnBaseAddress, &me) && _tcslen(me.szExePath) > 0) {
-                return true;
-            }
-            else {
-                wchar_t module_name[MAX_PATH];
-                if (GetMappedFileNameW(hProcess, pvmq->pvRgnBaseAddress, module_name, MAX_PATH) > 0) {
-                    return true;
+    
+    dprintf("Scanning memory for %d specific size(s)...\n", target_sizes.size());
+    
+    // 遍历所有内存页，筛选出符合 shellcode 特征的内存
+    for (int i = 0; i < memmap.count; i++) {
+        MEMPAGE* page = &memmap.page[i];
+        MEMORY_BASIC_INFORMATION* mbi = &page->mbi;
+        
+        // 筛选条件：
+        // 1. MEM_PRIVATE: 私有内存（不是镜像文件或映射文件）
+        // 2. PAGE_EXECUTE_READWRITE: 可执行、可读、可写
+        // 3. MEM_COMMIT: 已提交状态
+        // 4. info[0] == 0: 没有关联的模块信息
+        // 5. size 在目标大小列表中
+        if (mbi->Type == MEM_PRIVATE && 
+            (mbi->Protect & PAGE_EXECUTE_READWRITE) &&
+            mbi->State == MEM_COMMIT &&
+            page->info[0] == '\0') {
+            
+            // 检查当前内存块大小是否在目标列表中
+            bool size_matched = false;
+            for (DWORD target_size : target_sizes) {
+                if (mbi->RegionSize == target_size) {
+                    size_matched = true;
+                    break;
                 }
             }
-        }
-        return false;
-    };
-
-    BOOL bOk = TRUE;
-    DWORD pvAddress = NULL;
-    std::vector<MemoryInfo> result;
-    while (bOk) {
-        VMQUERY vmq;
-        bOk = VMQuery(hProcess, (LPCVOID)pvAddress, &vmq);
-        if (bOk) {
-            if (vmq.dwRgnStorage == MEM_PRIVATE && (vmq.dwRgnProtection & PAGE_EXECUTE_READWRITE) > 0 && !HasMappedModule(&vmq)) {
+            
+            if (size_matched) {
                 MemoryInfo mem_info;
-                mem_info.base_addr = (DWORD)vmq.pvRgnBaseAddress;
-                mem_info.size = vmq.RgnSize;
+                mem_info.base_addr = (DWORD)mbi->BaseAddress;
+                mem_info.size = mbi->RegionSize;
                 result.push_back(mem_info);
+                
+                dprintf("  Found: Base=0x%08X, Size=0x%08X\n", 
+                        mem_info.base_addr, mem_info.size);
             }
-            pvAddress = (DWORD)vmq.pvRgnBaseAddress + vmq.RgnSize;
         }
     }
+    
+    dprintf("Found %d matching memory region(s)\n", result.size());
     return result;
 }
 std::vector<unsigned char> ReadMem(LPVOID addr, size_t size)
 {
-    if (g_pid == 0) {
-        dputs("ReadMem g_pid is 0");
-        return {};
+    std::vector<unsigned char> result(size);
+    duint size_read = 0;
+    
+    // 使用 x64dbg 的 Script::Memory::Read API
+    if (Script::Memory::Read((duint)addr, result.data(), size, &size_read) && size_read == size) {
+        return result;
     }
-    HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, g_pid);
-    if (!hProcess) {
-        DWORD last_error = ::GetLastError();
-        dprintf("GetShellCodeMemoryList OpenProcess Failed:%d\n", last_error);
-        return {};
-    }
-    SetResDeleter(hProcess, [](HANDLE& h) {::CloseHandle(h); });
-    std::unique_ptr<unsigned char[]> feature_buffer(new unsigned char[size]);
-    SIZE_T read_size = 0;
-    if (::ReadProcessMemory(hProcess, addr, (LPVOID)feature_buffer.get(), size, &read_size) && read_size == size) {
-        std::vector<unsigned char> readed(size);
-        memcpy(readed.data(), feature_buffer.get(), size);
-        return readed;
-    }
+    
+    // 读取失败，返回空
     return {};
 }
 struct ShellCodeFeature {
     DWORD feature_offset = 0;
     std::vector<unsigned char> feature_code;
 };
-
-struct ShellCodeLineData {
-    DWORD offset = 0;
-    std::wstring text;
-};
-
-enum ManualInfoType : int{
-    NM_COMMENT = 0,
-    NM_LABEL,
-};
-
-std::vector<ShellCodeLineData> EnumShellCodeNames(const MemoryInfo& vmq, int info_type)
-{
-    std::vector<ShellCodeLineData>  comments;
-    if (info_type == NM_COMMENT) {
-        ListInfo list_info;
-        Script::Comment::GetList(&list_info);
-        std::vector<Script::Comment::CommentInfo> comment_list;
-        BridgeList<Script::Comment::CommentInfo>::ToVector(&list_info, comment_list, true);
-        for (auto& comment : comment_list) {
-            //comments.push_back(
-            if (comment.manual &&  chINRANGE(vmq.base_addr, comment.rva, vmq.base_addr + vmq.size)) {
-                ShellCodeLineData info;
-                info.offset = comment.rva - vmq.base_addr;
-                info.text = string_tool::utf8_to_wstring(comment.text);
-                comments.push_back(info);
-            }
-        }
-    }
-    else if(info_type == NM_LABEL){
-        ListInfo list_info;
-        Script::Label::GetList(&list_info);
-        std::vector<Script::Label::LabelInfo> comment_list;
-        BridgeList<Script::Label::LabelInfo>::ToVector(&list_info, comment_list, true);
-        for (auto& comment : comment_list) {
-            //comments.push_back(
-            if (comment.manual && chINRANGE(vmq.base_addr, comment.rva, vmq.base_addr + vmq.size)) {
-                ShellCodeLineData info;
-                info.offset = comment.rva - vmq.base_addr;
-                info.text = string_tool::utf8_to_wstring(comment.text);
-                comments.push_back(info);
-            }
-        }
-    }
-    return comments;
-}
-
 
 struct UserCustomShellCode {
     DWORD size = 0;
@@ -251,7 +213,9 @@ std::string BufferToLine(const std::vector<unsigned char>& buffer)
 {
     std::string s;
     for (auto& ch : buffer) {
-        s += fmt::format("{:02X}", ch);
+        char hex[3];
+        sprintf_s(hex, "%02X", ch);
+        s += hex;
     }
     return s;
 }
@@ -275,10 +239,10 @@ std::vector<UserCustomShellCode>  LoadUserCustomShellCodeFeature()
         dputs("LoadUserCustomShellCodeFeature GetMainModuleName Failed");
         return {};
     }
-    std::wstring file_name = GetMyPluginDataPath() + string_tool::CharToWide(process_name) + L".shellcode_features";
-    auto lines = file_tools::ReadAsciiFileLines(file_name);
+    std::wstring file_name = GetMyPluginDataPath() + CharToWide(process_name) + L".shellcode_features";
+    auto lines = ReadAsciiFileLines(file_name);
     for (auto& line : lines) {
-        auto items = string_tool::SplitStrByFlag<std::string>(line, "|");
+        auto items = SplitString<std::string>(line, "|");
         if (items.size() == 4) {
             size_t shellcode_size = std::stoul(items.at(0), nullptr, 16);
             std::string name = items.at(1);
@@ -287,7 +251,7 @@ std::vector<UserCustomShellCode>  LoadUserCustomShellCodeFeature()
 
             UserCustomShellCode custum_shellcode_feature;
             custum_shellcode_feature.size = shellcode_size;
-            custum_shellcode_feature.name = string_tool::utf8_to_wstring(name);
+            custum_shellcode_feature.name = Utf8ToWide(name);
             custum_shellcode_feature.feature.feature_code = feature_code;
             custum_shellcode_feature.feature.feature_offset = feature_offset;
             result.push_back(custum_shellcode_feature);
@@ -300,7 +264,26 @@ std::vector<UserCustomShellCode>  LoadUserCustomShellCodeFeature()
 std::map<DWORD, std::wstring>  AnalyzeCacheShellCodeBase(const std::vector<UserCustomShellCode>& shellcode_features)
 {
     std::map<DWORD, std::wstring> result;
-    auto shell_code_list = GetShellCodeMemoryList();
+    
+    // 提取所有 shellcode 的唯一大小，用于过滤内存扫描
+    std::vector<DWORD> target_sizes;
+    for (const auto& feature : shellcode_features) {
+        // 检查是否已经存在，避免重复
+        bool exists = false;
+        for (DWORD size : target_sizes) {
+            if (size == feature.size) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            target_sizes.push_back(feature.size);
+        }
+    }
+    
+    // 只扫描特定大小的内存块，提高效率
+    auto shell_code_list = GetShellCodeMemoryList(target_sizes);
+    
     for (const auto& shell_code : shell_code_list) {
         for (auto& feature : shellcode_features) {
             if (shell_code.size == feature.size) {
@@ -322,290 +305,485 @@ void SaveUserCustomShellCodeFeature(const std::vector<UserCustomShellCode>& shel
         dputs("LoadUserCustomShellCodeFeature GetMainModuleName Failed");
         return;
     }
-    std::wstring file_name = GetMyPluginDataPath() + string_tool::CharToWide(process_name) + L".shellcode_features";
+    std::wstring file_name = GetMyPluginDataPath() + CharToWide(process_name) + L".shellcode_features";
 
     std::string file_content;
     for (auto& feature : shellcode_features) {
-        std::string line = fmt::format("{:08X}|{}|{:08X}|{}\r\n", feature.size, string_tool::wstring_to_utf8(feature.name), feature.feature.feature_offset, BufferToLine(feature.feature.feature_code));
+        std::string line = FormatString("%08X|%s|%08X|%s\r\n", 
+            feature.size, 
+            WideToUtf8(feature.name).c_str(), 
+            feature.feature.feature_offset, 
+            BufferToLine(feature.feature.feature_code).c_str());
         file_content += line;
     }
-    file_tools::WriteFile(file_name, file_content.c_str(), file_content.length());
-}
-
-
-
-struct DialogCustomData {
-    DWORD base_addr = 0;
-    wchar_t name[100];
-    DWORD feature_addr_start;
-    DWORD feature_code_size;
-};
-
-
-BOOL CALLBACK InputShellCodeFeatureDialogProc(HWND dlg,
-    UINT message,
-    WPARAM wParam,
-    LPARAM lParam)
-{
-    switch (message)
-    {
-    case WM_INITDIALOG:
-    {
-        std::string text = fmt::format("{:#04x}", ((uint64_t)((DialogCustomData*)lParam)->base_addr));
-        SetDlgItemTextA(dlg, IDC_EDIT_BASE_ADDR, text.c_str());
-        ::SetWindowLongPtr(dlg, GWLP_USERDATA, lParam);
-        break;
-    }
-    case WM_COMMAND:
-        switch (LOWORD(wParam))
-        {
-        case IDOK:
-        {
-            wchar_t feature_name[100] = { 0 };
-            wchar_t szstart_addr[100] = { 0 };
-            wchar_t szend_addr[100] = { 0 };
-            GetDlgItemTextW(dlg, IDC_EDIT_NAME, feature_name, 100);
-            GetDlgItemTextW(dlg, IDC_EDIT_FEATURE_START_ADDR, szstart_addr, 100);
-            GetDlgItemTextW(dlg, IDC_EDIT_FEATURE_END_ADDR, szend_addr, 100);
-            DWORD start_addr = std::stoul(szstart_addr, nullptr, 16);
-            DWORD end_addr = std::stoul(szend_addr, nullptr, 16);
-            DWORD feature_code_size = end_addr - start_addr;
-            if (wcslen(feature_name) > 0 && start_addr >= 0 && feature_code_size > 0) {
-                DialogCustomData* data = (DialogCustomData*)::GetWindowLongPtr(dlg, GWLP_USERDATA);
-                wcscpy_s(data->name, feature_name);
-                data->feature_addr_start = start_addr;
-                data->feature_code_size = feature_code_size;
-                ::EndDialog(dlg, IDOK);
-            }
-            else {
-                ::MessageBoxW(dlg, L"Input Error", NULL, MB_OK);
-            }
-            break;
-        }
-        case IDCANCEL:
-            ::EndDialog(dlg, IDCANCEL);
-            break;
-        }
-        break;
-    default:
-        break;
-    }
-    return 0;
-}
-
-
-bool DialogInputAddShellCodeFeature(DWORD shellcode_base_addr, DWORD shellcode_size, std::wstring& name)
-{
-    //填充用户在意的shellcode
-
-    HWND main_window = (HWND)hwndDlg;
-
-    DialogCustomData dlg_data;
-    dlg_data.base_addr = shellcode_base_addr;
-    INT_PTR dlg_ret = DialogBoxParam(g_cur_dll_instalce, MAKEINTRESOURCE(IDD_DIALOG_INPUT_SHELLCODE_FEATURE), main_window, InputShellCodeFeatureDialogProc, (LPARAM)&dlg_data);
-    if (dlg_ret == IDOK) {
-        auto custom_shellcode_features = LoadUserCustomShellCodeFeature();
-        if (std::find_if(custom_shellcode_features.begin(), custom_shellcode_features.end(), [&dlg_data](const UserCustomShellCode& s) {return s.name == dlg_data.name; }) != custom_shellcode_features.end()) {
-            ::MessageBoxA(main_window, "ShellCode名称重复", NULL, MB_OK);
-            return false;
-        }
-        else {
-            if (g_pid == 0) {
-                dputs("ReadMem g_pid is 0");
-                return {};
-            }
-            HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, g_pid);
-            if (!hProcess) {
-                DWORD last_error = ::GetLastError();
-                dprintf("GetShellCodeMemoryList OpenProcess Failed:%d\n", last_error);
-                return {};
-            }
-            SetResDeleter(hProcess, [](HANDLE& h) {::CloseHandle(h); });
-
-            std::unique_ptr<unsigned char[]> feature_buffer(new unsigned char[dlg_data.feature_code_size]);
-            SIZE_T read_size = 0;
-            if (::ReadProcessMemory(hProcess, (LPCVOID)(dlg_data.feature_addr_start), (LPVOID)feature_buffer.get(), dlg_data.feature_code_size, &read_size) && read_size == dlg_data.feature_code_size) {
-                UserCustomShellCode custom_shellcode;
-                custom_shellcode.size = shellcode_size;
-                custom_shellcode.name = dlg_data.name;
-                for (size_t i = 0; i < dlg_data.feature_code_size; i++) {
-                    custom_shellcode.feature.feature_code.push_back(feature_buffer[i]);
-                }
-                custom_shellcode.feature.feature_offset = dlg_data.feature_addr_start - dlg_data.base_addr;
-                name = custom_shellcode.name;
-                custom_shellcode_features.push_back(custom_shellcode);
-                SaveUserCustomShellCodeFeature(custom_shellcode_features);
-                return true;
-            }
-            else {
-                dputs("ReadProcessMemory Failed");
-                return false;
-            }
-        }
-    }
-    else {
-        return false;
-    }
-}
-
-std::wstring GetCommentSavePath(const std::wstring& exe_name)
-{
-    return GetMyPluginDataPath() + exe_name + L"\\";
+    WriteFile(file_name, file_content.c_str(), file_content.length());
 }
 
 
 void LoadShellCodeComment()
 {
+    // 加载 shellcode 特征码配置
     auto shellcode_features = LoadUserCustomShellCodeFeature();
-    auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
-    //这里要检测是否要未保存的，要不然Load会覆盖
-    {
-        auto shell_code_list = GetShellCodeMemoryList();
-        HWND main_window = (HWND)hwndDlg;
-        for (const auto& vmq : shell_code_list) {
-            std::vector<ShellCodeLineData> comments = EnumShellCodeNames(vmq, NM_COMMENT);
-            std::vector<ShellCodeLineData> labels = EnumShellCodeNames(vmq, NM_LABEL);
-            if (comments.size() > 0 || labels.size() > 0) {
-                auto line = comments.size() > 0 ? comments.at(0) : labels.at(0);
-                if (IDYES == MessageBoxW(main_window, fmt::format(L"{:08X} {:08X}  {:08X}", vmq.base_addr, line.offset, vmq.base_addr + line.offset).c_str(), L"之前保存的注释可能会丢失，是否继续？", MB_YESNO)) {
-                    break;
-                }
-                else {
+    if (shellcode_features.empty()) {
+        dputs("No shellcode features found");
                     return;
-                }
-            }
-
-        }
     }
-    char process_name[MAX_PATH] = { 0 };
-    if (!Script::Module::GetMainModuleName(process_name)) {
-        dputs("LoadUserCustomShellCodeFeature GetMainModuleName Failed");
+
+    // 通过特征码分析并定位 shellcode 内存地址（内部已经使用 size 过滤优化）
+    auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
+    if (shellcode_map.empty()) {
+        dputs("No matching shellcode found in memory");
         return;
     }
-    std::wstring path = GetCommentSavePath(string_tool::CharToWide(process_name));
-    if (!file_tools::FileExist(path)) {
-        file_tools::CreateDirectoryNested(path);
+
+    dputs("Loading shellcode as virtual modules...");
+
+    // 创建名称到大小的映射，用于显示信息
+    std::map<std::wstring, DWORD> name_to_size_map;
+    for (const auto& feature : shellcode_features) {
+        name_to_size_map[feature.name] = feature.size;
     }
 
-    dputs("LoadShellcode Feature");
+    // 获取当前所有模块列表，存储虚拟模块的名称和base地址
+    ListInfo module_list;
+    std::map<std::string, duint> existing_virtual_modules;  // 名称 -> base地址
+    
+    if (Script::Module::GetList(&module_list)) {
+        std::vector<Script::Module::ModuleInfo> modules;
+        BridgeList<Script::Module::ModuleInfo>::ToVector(&module_list, modules, true);
+        
+        for (const auto& mod : modules) {
+            if (strncmp(mod.path, "virtual:\\", 9) == 0) {
+                existing_virtual_modules[mod.path + 9] = mod.base;
+            }
+        }
+    }
 
-    auto shell_code_list = GetShellCodeMemoryList();
-    for (const auto& vmq : shell_code_list) {
-        auto iter = shellcode_map.find(vmq.base_addr);
-        if (iter != shellcode_map.end()) {
-            std::wstring name = iter->second;
+    int success_count = 0;
+    int failed_count = 0;
+    int skipped_count = 0;
+    int relocated_count = 0;
+
+    // 直接遍历匹配结果，不需要再次扫描内存
+    for (const auto& entry : shellcode_map) {
+        DWORD base_addr = entry.first;
+        std::wstring name = entry.second;
 
             if (name.length() > 0) {
-                dprintf("ShellCode:0x%08x  size:0x%08x\n", vmq.base_addr, vmq.size);
-                std::wstring file_name = path + name + L".txt";
-                auto lines = file_tools::ReadAsciiFileLines(file_name);
-                for (const auto& line : lines) {
-                    //0003B853^COMMENT^ssssssssss;
-                    auto flag = line.find('^');
-                    if (flag == std::string::npos) {
-                        dputs("^ is not find1");
-                        continue;
-                    }
-                    DWORD offset = std::stoul(line.substr(0, flag), nullptr, 16);
-
-                    auto flag2 = line.find('^', flag + 1);
-                    if (flag2 == std::string::npos) {
-                        dputs("^ is not find2");
-                        continue;
-                    }
-                    std::string type_name = line.substr(flag + 1, flag2 - (flag + 1));
-                    if (type_name.empty() || (type_name != "COMMENT" && type_name != "LABEL")) {
-                        dputs("^ is not find not comment and label");
-                        continue;
-                    }
-
-                    std::string text = line.substr(flag2 + 1);
-
-                    dprintf("%s  addr:0x%08x,:%s\n", type_name.c_str(), vmq.base_addr + offset, text.c_str());
-
-                    char ansi_text[500] = { 0 };
-                    strcpy_s(ansi_text, text.c_str());
-                    if (type_name == "COMMENT") {
-                        Script::Comment::Set(vmq.base_addr + offset, ansi_text, true);
-                    }
-                    else if (type_name == "LABEL") {
-                        Script::Label::Set(vmq.base_addr + offset, ansi_text, true);
-                    }
+            // 构造 x64dbg 命令：virtualmod <name>,<address>
+            std::string module_name = WideToUtf8(name);
+            DWORD size = name_to_size_map[name];
+            
+            // 检查是否已经存在同名的虚拟模块
+            auto it = existing_virtual_modules.find(module_name);
+            if (it != existing_virtual_modules.end()) {
+                duint existing_base = it->second;
+                
+                if (existing_base == base_addr) {
+                    // Base地址相同，跳过
+                    dprintf("Skipped (already loaded): %s at 0x%08X (size: 0x%08X)\n", 
+                            module_name.c_str(), base_addr, size);
+                    skipped_count++;
+                    continue;
                 }
-            }
-        }
-    }
-}
-
-
-
-
-void SaveShellCodeComment()
-{
-    //遍历 ShellCode
-    //遍历 ShellCode里注释
-    //保存注释 怎么标识一个ShellCode? 1.大小 2.特征码（shellcode md5?） 感觉也不行。因为shellcode有些地址每次加载都会被换掉 所以只能自己标识，那就用指定偏移的一段特征码标识吧
-    auto shellcode_features = LoadUserCustomShellCodeFeature();
-    auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
-
-    dprintf("shellcode_features:%d matched_count:%d\n",shellcode_features.size(),shellcode_map.size());
-
-    char process_name[MAX_PATH] = { 0 };
-    if (!Script::Module::GetMainModuleName(process_name)) {
-        dputs("LoadUserCustomShellCodeFeature GetMainModuleName Failed");
-        return;
-    }
-
-    std::wstring path = GetCommentSavePath(string_tool::CharToWide(process_name));
-    if (!file_tools::FileExist(path)) {
-        file_tools::CreateDirectoryNested(path);
-    }
-
-    auto shell_code_list = GetShellCodeMemoryList();
-    for (const auto& vmq : shell_code_list) {
-        std::vector<ShellCodeLineData> comments = EnumShellCodeNames(vmq, NM_COMMENT);
-        std::vector<ShellCodeLineData> labels = EnumShellCodeNames(vmq, NM_LABEL);
-
-
-        if (comments.size() > 0 || labels.size()) {
-            auto iter = shellcode_map.find(vmq.base_addr);
-            std::wstring name;
-            if (iter == shellcode_map.end()) {
-                if (!DialogInputAddShellCodeFeature(vmq.base_addr, vmq.size, name)) {
+                else {
+                    // Base地址不同，重要警告
+                    dprintf("===========================================\n");
+                    dprintf("!!! WARNING: ShellCode relocated !!!\n");
+                    dprintf("  Module name: %s\n", module_name.c_str());
+                    dprintf("  Old base: 0x%08X\n", existing_base);
+                    dprintf("  New base: 0x%08X\n", base_addr);
+                    dprintf("  Size: 0x%08X\n", size);
+                    dprintf("===========================================\n");
+                    
+                    char msg[512];
+                    sprintf_s(msg, "ShellCode '%s' has been relocated!\n\nOld base: 0x%08X\nNew base: 0x%08X\n\nPlease unload the old virtual module first.", 
+                              module_name.c_str(), existing_base, base_addr);
+                    MessageBoxA(hwndDlg, msg, "ShellCode Relocated Warning", MB_ICONWARNING);
+                    
+                    relocated_count++;
                     continue;
                 }
             }
-            else {
-                name = iter->second;
-            }
+            
+            char cmd[512];
+            sprintf_s(cmd, "virtualmod %s,%X", module_name.c_str(), base_addr);
 
-            std::wstring file_name = path + name + L".txt";
-            std::string file_content;
-            for (const auto& comment : comments) {
-                std::string line = fmt::format("{:08X}^COMMENT^{}\r\n", comment.offset, string_tool::wstring_to_utf8(comment.text));
-                file_content += line;
+            // 执行命令
+            if (DbgCmdExecDirect(cmd)) {
+                dprintf("? Created virtual module: %s at 0x%08X (size: 0x%08X)\n", 
+                        module_name.c_str(), base_addr, size);
+                success_count++;
             }
-            for (const auto& comment : labels) {
-                std::string line = fmt::format("{:08X}^LABEL^{}\r\n", comment.offset, string_tool::wstring_to_utf8(comment.text));
-                file_content += line;
+            else {
+                dprintf("? Failed to create virtual module: %s at 0x%08X\n", 
+                        module_name.c_str(), base_addr);
+                failed_count++;
             }
-            file_tools::WriteFile(file_name, file_content.c_str(), file_content.length());
         }
     }
+
+    // 显示统计信息
+    dprintf("===========================================\n");
+    dprintf("Virtual module creation completed:\n");
+    dprintf("  Total shellcode features: %d\n", shellcode_features.size());
+    dprintf("  Matched in memory: %d\n", shellcode_map.size());
+    dprintf("  Successfully created: %d\n", success_count);
+    dprintf("  Skipped (already loaded): %d\n", skipped_count);
+    dprintf("  Relocated (base changed): %d\n", relocated_count);
+    dprintf("  Failed: %d\n", failed_count);
+    dprintf("===========================================\n");
+
+    // 如果有成功创建的，刷新模块列表
+    if (success_count > 0) {
+        DbgCmdExecDirect("modlist");
+    }
 }
+
+
+
 
 void EnumShellCodeByFeature()
 {
     auto shellcode_features = LoadUserCustomShellCodeFeature();
     auto shellcode_map = AnalyzeCacheShellCodeBase(shellcode_features);
+
+    dputs("===========================================");
+    dprintf("Found %d shellcode features in config\n", shellcode_features.size());
+    dprintf("Matched %d shellcode(s) in memory:\n", shellcode_map.size());
+    dputs("===========================================");
+    
     for (auto it : shellcode_map) {
-        dprintf("ShellCodeName:%s,BaseAddr:%8x\n",string_tool::wstring_to_utf8(it.second).c_str(), it.first);
+        dprintf("  [%s] at 0x%08X\n", WideToUtf8(it.second).c_str(), it.first);
+    }
+    
+    if (shellcode_map.empty()) {
+        dputs("No shellcode found. Please ensure:");
+        dputs("  1. The target process contains the shellcode");
+        dputs("  2. Feature signatures are correctly configured");
     }
 }
 
-void SearchString()
+void UnloadAllVirtualModules()
 {
+    ListInfo module_list;
+    if (!Script::Module::GetList(&module_list)) {
+        dputs("Failed to get module list");
+        return;
+    }
 
+    std::vector<Script::Module::ModuleInfo> modules;
+    BridgeList<Script::Module::ModuleInfo>::ToVector(&module_list, modules, true);
+
+    int unload_count = 0;
+    int failed_count = 0;
+
+    dputs("Scanning for virtual modules...");
+
+    for (const auto& mod : modules) {
+        if (strncmp(mod.path, "virtual:\\", 9) == 0) {
+            const char* module_name = mod.path + 9;
+            
+            char cmd[512];
+            sprintf_s(cmd, "virtualmoddel %s", module_name);
+            
+            if (DbgCmdExecDirect(cmd)) {
+                dprintf("? Unloaded virtual module: %s\n", module_name);
+                unload_count++;
+            }
+            else {
+                dprintf("? Failed to unload virtual module: %s\n", module_name);
+                failed_count++;
+            }
+        }
+    }
+
+    dputs("===========================================");
+    dprintf("Unload completed:\n");
+    dprintf("  Successfully unloaded: %d\n", unload_count);
+    dprintf("  Failed: %d\n", failed_count);
+    dputs("===========================================");
+
+    if (unload_count > 0) {
+        GuiUpdateAllViews();
+    }
+}
+
+void MarkAsShellCode()
+{
+    duint sel_start = 0, sel_end = 0;
+    
+    if (!Script::Gui::Disassembly::SelectionGet(&sel_start, &sel_end)) {
+        MessageBoxA(hwndDlg, "Please select shellcode range in disassembly window", "Error", MB_ICONERROR);
+        return;
+    }
+    
+    if (sel_start >= sel_end) {
+        MessageBoxA(hwndDlg, "Invalid selection range", "Error", MB_ICONERROR);
+        return;
+    }
+    
+    duint shellcode_base = Script::Memory::GetBase(sel_start);
+    if (shellcode_base == 0) {
+        MessageBoxA(hwndDlg, "Failed to get memory base address", "Error", MB_ICONERROR);
+        return;
+    }
+    
+    duint shellcode_size = Script::Memory::GetSize(sel_start);
+    if (shellcode_size == 0) {
+        MessageBoxA(hwndDlg, "Failed to get memory size", "Error", MB_ICONERROR);
+        return;
+    }
+    
+    char shellcode_name[256] = {0};
+    
+    if (!GuiGetLineWindow("Enter ShellCode Name", shellcode_name)) {
+        return;
+    }
+    
+    if (strlen(shellcode_name) == 0) {
+        MessageBoxA(hwndDlg, "ShellCode name cannot be empty", "Error", MB_ICONERROR);
+        return;
+    }
+    
+    auto existing_features = LoadUserCustomShellCodeFeature();
+    std::wstring wname = CharToWide(shellcode_name);
+    
+    for (const auto& feature : existing_features) {
+        if (feature.name == wname) {
+            MessageBoxA(hwndDlg, "ShellCode name already exists", "Error", MB_ICONERROR);
+            return;
+        }
+    }
+    
+    DWORD feature_offset = sel_start - shellcode_base;
+    DWORD feature_size = sel_end - sel_start;
+    
+    auto feature_bytes = ReadMem((LPVOID)sel_start, feature_size);
+    if (feature_bytes.empty()) {
+        MessageBoxA(hwndDlg, "Failed to read feature bytes", "Error", MB_ICONERROR);
+        return;
+    }
+    
+    UserCustomShellCode new_feature;
+    new_feature.size = shellcode_size;
+    new_feature.name = wname;
+    new_feature.feature.feature_offset = feature_offset;
+    new_feature.feature.feature_code = feature_bytes;
+    
+    existing_features.push_back(new_feature);
+    SaveUserCustomShellCodeFeature(existing_features);
+    
+    dprintf("ShellCode feature added successfully:\n");
+    dprintf("  Name: %s\n", shellcode_name);
+    dprintf("  Base: 0x%08X\n", shellcode_base);
+    dprintf("  Size: 0x%08X\n", shellcode_size);
+    dprintf("  Feature Offset: 0x%08X\n", feature_offset);
+    dprintf("  Feature Size: 0x%08X\n", feature_size);
+    
+    MessageBoxA(hwndDlg, "ShellCode feature added successfully", "Success", MB_ICONINFORMATION);
+}
+
+struct ViewFeaturesDialogData {
+    std::vector<UserCustomShellCode>* features;
+    bool modified;
+};
+
+INT_PTR CALLBACK ViewFeaturesDlgProc(HWND dlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        ViewFeaturesDialogData* data = (ViewFeaturesDialogData*)lParam;
+        SetWindowLongPtr(dlg, GWLP_USERDATA, lParam);
+        
+        HWND hList = GetDlgItem(dlg, IDC_LIST_FEATURES);
+        
+        ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        
+        LVCOLUMNA col = {0};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        
+        col.pszText = (LPSTR)"Name";
+        col.cx = 150;
+        ListView_InsertColumn(hList, 0, &col);
+        
+        col.pszText = (LPSTR)"Size";
+        col.cx = 80;
+        ListView_InsertColumn(hList, 1, &col);
+        
+        col.pszText = (LPSTR)"Offset";
+        col.cx = 80;
+        ListView_InsertColumn(hList, 2, &col);
+        
+        col.pszText = (LPSTR)"Feature Bytes";
+        col.cx = 280;
+        ListView_InsertColumn(hList, 3, &col);
+        
+        for (size_t i = 0; i < data->features->size(); i++) {
+            const auto& feature = data->features->at(i);
+            
+            std::string name = WideToUtf8(feature.name);
+            char nameBuf[256];
+            strcpy_s(nameBuf, name.c_str());
+            
+            LVITEMA item = {0};
+            item.mask = LVIF_TEXT | LVIF_PARAM;
+            item.iItem = (int)i;
+            item.lParam = (LPARAM)i;
+            item.pszText = nameBuf;
+            int idx = ListView_InsertItem(hList, &item);
+            
+            char buf[256];
+            sprintf_s(buf, "0x%08X", feature.size);
+            ListView_SetItemText(hList, idx, 1, buf);
+            
+            sprintf_s(buf, "0x%08X", feature.feature.feature_offset);
+            ListView_SetItemText(hList, idx, 2, buf);
+            
+            std::string bytes = BufferToLine(feature.feature.feature_code);
+            if (bytes.length() > 40) {
+                bytes = bytes.substr(0, 40) + "...";
+            }
+            strcpy_s(buf, bytes.c_str());
+            ListView_SetItemText(hList, idx, 3, buf);
+        }
+        
+        break;
+    }
+    
+    case WM_COMMAND:
+        switch (LOWORD(wParam))
+        {
+        case IDC_BTN_DELETE:
+        {
+            ViewFeaturesDialogData* data = (ViewFeaturesDialogData*)GetWindowLongPtr(dlg, GWLP_USERDATA);
+            HWND hList = GetDlgItem(dlg, IDC_LIST_FEATURES);
+            
+            int sel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
+            if (sel == -1) {
+                MessageBoxA(dlg, "Please select a feature to delete", "Info", MB_ICONINFORMATION);
+                break;
+            }
+            
+            LVITEMA item = {0};
+            item.mask = LVIF_PARAM;
+            item.iItem = sel;
+            ListView_GetItem(hList, &item);
+            int idx = (int)item.lParam;
+            
+            std::string name = WideToUtf8(data->features->at(idx).name);
+            std::string msg = FormatString("Delete feature: %s?", name.c_str());
+            
+            if (IDYES == MessageBoxA(dlg, msg.c_str(), "Confirm Delete", MB_YESNO | MB_ICONQUESTION)) {
+                data->features->erase(data->features->begin() + idx);
+                ListView_DeleteItem(hList, sel);
+                data->modified = true;
+                
+                for (int i = sel; i < ListView_GetItemCount(hList); i++) {
+                    LVITEMA updateItem = {0};
+                    updateItem.mask = LVIF_PARAM;
+                    updateItem.iItem = i;
+                    ListView_GetItem(hList, &updateItem);
+                    updateItem.lParam = updateItem.lParam - 1;
+                    ListView_SetItem(hList, &updateItem);
+                }
+            }
+            break;
+        }
+        
+        case IDC_BTN_CLOSE:
+        case IDCANCEL:
+            EndDialog(dlg, IDOK);
+            break;
+        }
+        break;
+        
+    case WM_CLOSE:
+        EndDialog(dlg, IDCANCEL);
+        break;
+    
+    default:
+        break;
+    }
+    
+    return 0;
+}
+
+void ViewShellCodeFeatures()
+{
+    dputs("ViewShellCodeFeatures called");
+    
+    auto features = LoadUserCustomShellCodeFeature();
+    
+    dprintf("Loaded %d features\n", features.size());
+    
+    if (features.empty()) {
+        dputs("No features found, showing message box");
+        MessageBoxA(hwndDlg, "No shellcode features found in configuration file", "Info", MB_ICONINFORMATION);
+        return;
+    }
+    
+    ViewFeaturesDialogData data;
+    data.features = &features;
+    data.modified = false;
+    
+    dprintf("g_cur_dll_instalce = %p, hwndDlg = %p\n", g_cur_dll_instalce, hwndDlg);
+    dputs("Showing dialog...");
+    
+    INT_PTR result = DialogBoxParam(g_cur_dll_instalce, MAKEINTRESOURCE(IDD_DIALOG_VIEW_FEATURES), hwndDlg, ViewFeaturesDlgProc, (LPARAM)&data);
+    
+    dprintf("Dialog result: %d\n", result);
+    
+    if (data.modified) {
+        SaveUserCustomShellCodeFeature(features);
+        dputs("ShellCode features saved");
+    }
+}
+
+
+bool cbRemoveAllVirtualModCommand(int argc, char** argv)
+{
+    ListInfo module_list;
+    if (!Script::Module::GetList(&module_list)) {
+        dputs("Failed to get module list");
+        return false;
+    }
+
+    std::vector<Script::Module::ModuleInfo> modules;
+    BridgeList<Script::Module::ModuleInfo>::ToVector(&module_list, modules, true);
+
+    int unload_count = 0;
+    int failed_count = 0;
+
+    dputs("Scanning for virtual modules...");
+
+    for (const auto& mod : modules) {
+        if (strncmp(mod.path, "virtual:\\", 9) == 0) {
+            const char* module_name = mod.path + 9;
+            
+            char cmd[512];
+            sprintf_s(cmd, "virtualmoddel %s", module_name);
+            
+            if (DbgCmdExecDirect(cmd)) {
+                dprintf("Unloaded: %s\n", module_name);
+                unload_count++;
+            }
+            else {
+                dprintf("Failed: %s\n", module_name);
+                failed_count++;
+            }
+        }
+    }
+
+    dprintf("Unloaded %d virtual module(s), %d failed\n", unload_count, failed_count);
+
+    if (unload_count > 0) {
+        GuiUpdateAllViews();
+    }
+    
+    return true;
 }
 
 
